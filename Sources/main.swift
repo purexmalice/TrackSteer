@@ -34,6 +34,17 @@ enum Config {
     /// Fingers that must be down for the drag.
     static var fingerCount = 2
 
+    /// Master switch, so the gesture can be paused without quitting.
+    static var enabled = true
+
+    /// How the drag is triggered.
+    ///   .rest  — two fingers touching is enough. Nothing is held, which is
+    ///            more comfortable but unlike any mouse.
+    ///   .press — the trackpad must be physically clicked, matching the
+    ///            both-buttons-held gesture this replaces.
+    enum Trigger: String { case rest, press }
+    static var trigger: Trigger = .rest
+
     /// Scales trackpad movement into mouse movement. 1.0 tracks the system's own
     /// trackpad acceleration, which macOS has already applied to the scroll
     /// deltas we read -- so the default inherits Apple's tuning rather than
@@ -71,15 +82,38 @@ enum Config {
             !value.isEmpty {
             targetBundleIDs = Set(value)
         }
+
+        if let value = defaults.object(forKey: "enabled") as? Bool {
+            enabled = value
+        }
+
+        if let raw = defaults.string(forKey: "trigger"),
+            let value = Trigger(rawValue: raw) {
+            trigger = value
+        }
     }
+
+    static func save() {
+        defaults.set(sensitivity, forKey: "sensitivity")
+        defaults.set(enabled, forKey: "enabled")
+        defaults.set(trigger.rawValue, forKey: "trigger")
+    }
+
+    static var onExternalChange: (() -> Void)?
 
     static func watch() {
         Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
             let before = (sensitivity, fingerCount, targetBundleIDs)
             load()
-            if before != (sensitivity, fingerCount, targetBundleIDs) {
+            var changed = before != (sensitivity, fingerCount, targetBundleIDs)
+            if changed {
                 log("settings changed: sensitivity=\(sensitivity) fingers=\(fingerCount)")
             }
+
+            // Settings sent from the addon, arriving via SavedVariables.
+            if AddonSettings.poll() { changed = true }
+
+            if changed { onExternalChange?() }
         }
     }
 }
@@ -120,6 +154,12 @@ final class State: @unchecked Sendable {
     var fingersDown: Int = 0
     var middleButtonHeld = false
     var targetAppActive = false
+
+    /// Press mode only: the trackpad is physically held down.
+    var physicalPress = false
+    /// Whether the current press has actually moved, which decides if it was a
+    /// drag or just a click that should be passed along.
+    var pressMoved = false
 
     /// Where the drag started. Every synthetic event is reported at this exact
     /// point and it never moves, so the pointer is still where the player left
@@ -259,7 +299,12 @@ nonisolated(unsafe) var activeTap: CFMachPort?
 final class ScrollInterceptor {
 
     func start() -> Bool {
-        let mask = (1 << CGEventType.scrollWheel.rawValue)
+        // Right-button events are needed for press mode: a two-finger click on
+        // a Mac trackpad is a secondary click.
+        let mask =
+            (1 << CGEventType.scrollWheel.rawValue)
+            | (1 << CGEventType.rightMouseDown.rawValue)
+            | (1 << CGEventType.rightMouseUp.rawValue)
 
         guard
             let tap = CGEvent.tapCreate(
@@ -296,13 +341,47 @@ final class ScrollInterceptor {
             return passThrough
         }
 
+        // Press mode: a two-finger click starts the drag and holds it.
+        if type == .rightMouseDown || type == .rightMouseUp {
+            guard Config.enabled, Config.trigger == .press, state.targetAppActive,
+                state.fingersDown == Config.fingerCount
+            else { return passThrough }
+
+            if type == .rightMouseDown {
+                state.physicalPress = true
+                state.pressMoved = false
+                return nil  // swallow; replayed on release if it was only a click
+            }
+
+            state.physicalPress = false
+            Mouse.release()
+
+            if !state.pressMoved {
+                // Never moved, so the player meant an ordinary right click.
+                // Put it back rather than eating it.
+                let location = event.location
+                for phase in [CGEventType.rightMouseDown, .rightMouseUp] {
+                    CGEvent(
+                        mouseEventSource: Mouse.source, mouseType: phase,
+                        mouseCursorPosition: location, mouseButton: .right
+                    )?.post(tap: .cghidEventTap)
+                }
+            }
+            return nil
+        }
+
         guard type == .scrollWheel else { return passThrough }
 
         // Outside the target app, or without the right fingers down, this is an
         // ordinary scroll and none of our business.
         debug("scroll: fingers=\(state.fingersDown) target=\(state.targetAppActive) held=\(state.middleButtonHeld)")
 
-        guard state.targetAppActive, state.fingersDown == Config.fingerCount else {
+        // In press mode the trackpad must also be held down.
+        let triggered = Config.trigger == .rest || state.physicalPress
+
+        guard Config.enabled, triggered, state.targetAppActive,
+            state.fingersDown == Config.fingerCount
+        else {
             if state.middleButtonHeld { Mouse.release() }
             return passThrough
         }
@@ -313,6 +392,7 @@ final class ScrollInterceptor {
         let dy = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1))
         let dx = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis2))
 
+        state.pressMoved = true
         Mouse.press()
         // Scroll deltas are inverted relative to pointer movement: scrolling
         // "down" moves content up, but dragging down should move the pointer
@@ -329,6 +409,9 @@ final class ScrollInterceptor {
 final class AppScope {
     private var observer: NSObjectProtocol?
 
+    /// Lets the menu refresh when focus changes, so its status stays true.
+    var onChange: (() -> Void)?
+
     func start() {
         update()
         observer = NSWorkspace.shared.notificationCenter.addObserver(
@@ -344,11 +427,250 @@ final class AppScope {
         let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
         let active = Config.targetBundleIDs.contains(bundleID)
         State.shared.targetAppActive = active
+        onChange?()
 
         // Never leave the button stuck down when switching away mid-drag.
         if !active && State.shared.middleButtonHeld {
             Mouse.release()
         }
+    }
+}
+
+// MARK: - Settings from the addon
+//
+// BindSwap cannot talk to this app while the game runs -- WoW addons have no
+// file or network access. The one channel is SavedVariables, which the client
+// flushes on /reload or logout. So we watch that file instead.
+//
+// Parsed with a narrow regex rather than a Lua interpreter: we want exactly
+// three known values out of a file the game owns, and anything we do not
+// recognise is ignored rather than guessed at.
+
+enum AddonSettings {
+    static let searchRoots = [
+        "/Applications/World of Warcraft/_retail_/WTF/Account"
+    ]
+
+    private static var lastSeen: Date?
+
+    /// Locate BindSwap.lua under any account folder.
+    static func savedVariablesPath() -> String? {
+        let fm = FileManager.default
+        for root in searchRoots {
+            guard let accounts = try? fm.contentsOfDirectory(atPath: root) else { continue }
+            for account in accounts {
+                let path = "\(root)/\(account)/SavedVariables/BindSwap.lua"
+                if fm.fileExists(atPath: path) { return path }
+            }
+        }
+        return nil
+    }
+
+    private static func value(_ key: String, in text: String) -> String? {
+        // Matches  ["key"] = value  with or without quotes.
+        let pattern = "\\[\"\(key)\"\\]\\s*=\\s*\"?([^\",\n]+)\"?"
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+            let match = regex.firstMatch(
+                in: text, range: NSRange(text.startIndex..., in: text)),
+            let range = Range(match.range(at: 1), in: text)
+        else { return nil }
+        return text[range].trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Returns true if anything actually changed.
+    static func poll() -> Bool {
+        guard let path = savedVariablesPath(),
+            let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+            let modified = attrs[.modificationDate] as? Date
+        else { return false }
+
+        // Only re-read when the game has rewritten the file.
+        if let seen = lastSeen, seen >= modified { return false }
+        lastSeen = modified
+
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8),
+            let blockStart = text.range(of: "[\"trackSteer\"]")
+        else { return false }
+
+        let block = String(text[blockStart.lowerBound...].prefix(400))
+        var changed = false
+
+        if let raw = value("trigger", in: block),
+            let mode = Config.Trigger(rawValue: raw), mode != Config.trigger {
+            Config.trigger = mode
+            changed = true
+        }
+
+        if let raw = value("sensitivity", in: block), let number = Double(raw),
+            number > 0, number <= 10, abs(number - Config.sensitivity) > 0.01 {
+            Config.sensitivity = number
+            changed = true
+        }
+
+        if changed {
+            Mouse.release()  // never carry a drag across a settings change
+            Config.save()
+            log("settings updated from the addon: \(Config.trigger.rawValue), \(Config.sensitivity)")
+        }
+        return changed
+    }
+}
+
+// MARK: - Menu bar
+//
+// The only reason this app has any UI: turn speed has to be adjustable by
+// someone who will never open Terminal. Presets rather than a slider, because
+// four named choices are easier to reason about than a number, and the useful
+// range here is narrow.
+
+final class MenuBar: NSObject {
+    private var statusItem: NSStatusItem?
+
+    private static let speeds: [(String, Double)] = [
+        ("Slow", 0.6),
+        ("Normal", 1.0),
+        ("Fast", 1.5),
+        ("Faster", 2.0),
+    ]
+
+    func start() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+        // Always give the button a title. If the symbol name is ever wrong the
+        // image is nil, and a status item with neither image nor title has zero
+        // width -- it is running and completely invisible, which is the worst
+        // possible failure for a menu bar app.
+        // A text label rather than a symbol. The icon version was reported as
+        // invisible even though the system said it was there with real
+        // geometry, and a menu bar item nobody can find is worth nothing --
+        // legibility beats elegance here.
+        item.button?.title = "TS"
+
+        statusItem = item
+        rebuild()
+        log("menu bar item created")
+    }
+
+    /// Rebuilt on every change so the ticks always match reality, rather than
+    /// tracking menu item state separately and letting the two drift.
+    func rebuild() {
+        let menu = NSMenu()
+
+        let trusted = AXIsProcessTrusted()
+
+        // Report the actual reason it is idle. Silently doing nothing while
+        // claiming to be "on" is what made this look broken twice: once for a
+        // revoked permission, once because another app had focus.
+        let statusText: String
+        if !trusted {
+            statusText = "Needs Accessibility permission"
+        } else if !Config.enabled {
+            statusText = "TrackSteer is paused"
+        } else if !State.shared.targetAppActive {
+            statusText = "Waiting — World of Warcraft isn't frontmost"
+        } else {
+            statusText = "TrackSteer is active"
+        }
+
+        let status = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(status)
+
+        if !trusted {
+            let fix = NSMenuItem(
+                title: "Open Accessibility settings…",
+                action: #selector(openAccessibility), keyEquivalent: "")
+            fix.target = self
+            menu.addItem(fix)
+        }
+
+        let toggle = NSMenuItem(
+            title: Config.enabled ? "Pause" : "Resume",
+            action: #selector(toggleEnabled), keyEquivalent: "")
+        toggle.target = self
+        menu.addItem(toggle)
+
+        menu.addItem(.separator())
+
+        let triggerHeader = NSMenuItem(title: "Gesture", action: nil, keyEquivalent: "")
+        triggerHeader.isEnabled = false
+        menu.addItem(triggerHeader)
+
+        for (title, mode) in [
+            ("  Two fingers resting", Config.Trigger.rest),
+            ("  Two fingers pressed down", Config.Trigger.press),
+        ] {
+            let entry = NSMenuItem(
+                title: title, action: #selector(setTrigger(_:)), keyEquivalent: "")
+            entry.target = self
+            entry.representedObject = mode.rawValue
+            entry.state = Config.trigger == mode ? .on : .off
+            menu.addItem(entry)
+        }
+
+        menu.addItem(.separator())
+
+        let header = NSMenuItem(title: "Turn speed", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+
+        for (index, speed) in MenuBar.speeds.enumerated() {
+            let entry = NSMenuItem(
+                title: "  \(speed.0)", action: #selector(setSpeed(_:)), keyEquivalent: "")
+            entry.target = self
+            entry.tag = index
+            entry.state = abs(Config.sensitivity - speed.1) < 0.01 ? .on : .off
+            menu.addItem(entry)
+        }
+
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(
+            title: "Two-finger drag to run and steer, in World of Warcraft",
+            action: nil, keyEquivalent: ""))
+        menu.items.last?.isEnabled = false
+
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit TrackSteer", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+
+        statusItem?.menu = menu
+    }
+
+    @objc private func toggleEnabled() {
+        Config.enabled.toggle()
+        if !Config.enabled { Mouse.release() }
+        Config.save()
+        rebuild()
+    }
+
+    @objc private func setSpeed(_ sender: NSMenuItem) {
+        guard MenuBar.speeds.indices.contains(sender.tag) else { return }
+        Config.sensitivity = MenuBar.speeds[sender.tag].1
+        Config.save()
+        rebuild()
+    }
+
+    @objc private func setTrigger(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+            let mode = Config.Trigger(rawValue: raw)
+        else { return }
+
+        Config.trigger = mode
+        Mouse.release()  // never leave a drag hanging across a mode change
+        Config.save()
+        rebuild()
+    }
+
+    @objc private func openAccessibility() {
+        let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func quit() {
+        Mouse.release()
+        NSApplication.shared.terminate(nil)
     }
 }
 
@@ -369,21 +691,51 @@ let touches = TouchMonitor()
 let scroll = ScrollInterceptor()
 let scope = AppScope()
 
-guard AXIsProcessTrusted() else {
-    log("Accessibility permission not granted.")
+// Ask for Accessibility, prompting if it is missing, and keep running either
+// way. Exiting here was a mistake: an ad-hoc signature changes on every build,
+// so macOS revokes the grant after each update and the app would simply vanish
+// on launch with nothing on screen to explain why.
+let trusted = AXIsProcessTrustedWithOptions(
+    [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
+
+if !trusted {
+    log("Accessibility not granted yet -- the menu bar icon will say so.")
     log("System Settings > Privacy & Security > Accessibility, then add TrackSteer.")
-    exit(1)
 }
 
-guard scroll.start() else {
-    log("could not create the event tap -- is Accessibility actually enabled?")
-    exit(1)
+if trusted {
+    if !scroll.start() {
+        log("could not create the event tap despite being trusted")
+    }
+    touches.start()
+}
+
+// Permission is usually granted a few seconds after the prompt, so pick it up
+// without making the user relaunch.
+if !trusted {
+    Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { timer in
+        guard AXIsProcessTrusted() else { return }
+        timer.invalidate()
+        _ = scroll.start()
+        touches.start()
+        menuBar.rebuild()
+        log("Accessibility granted -- now active.")
+    }
 }
 
 Config.load()
 Config.watch()
 
-touches.start()
+// Instantiate the app before touching NSStatusBar: the status bar belongs to a
+// running application, and creating an item before that exists silently does
+// nothing.
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)  // background only, no Dock icon
+
+let menuBar = MenuBar()
+menuBar.start()
+scope.onChange = { menuBar.rebuild() }
+Config.onExternalChange = { menuBar.rebuild() }
 scope.start()
 
 log("running. \(Config.fingerCount)-finger drag = middle button, sensitivity \(Config.sensitivity), in \(Config.targetBundleIDs.joined(separator: ", "))")
@@ -392,6 +744,4 @@ log("running. \(Config.fingerCount)-finger drag = middle button, sensitivity \(C
 signal(SIGINT) { _ in Mouse.release(); exit(0) }
 signal(SIGTERM) { _ in Mouse.release(); exit(0) }
 
-let app = NSApplication.shared
-app.setActivationPolicy(.accessory)  // background only, no Dock icon
 app.run()
