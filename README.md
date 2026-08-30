@@ -45,13 +45,26 @@ Builds `TrackSteer.app`, ad-hoc signs it, and installs to `~/Applications`.
    [BindSwap](../bindswap-addon) addon does this in one click via its
    **Trackpad 2-finger** preset.
 
-## Configuration
+## Settings
 
-At the top of `Sources/main.swift`:
+Changed with `defaults`, and picked up within a couple of seconds — no restart:
 
-- `targetBundleIDs` — which apps it applies to
-- `fingerCount` — fingers required (2)
-- `sensitivity` — scales trackpad movement into mouse movement
+```bash
+# Turn speed. 1.0 tracks the system's own trackpad acceleration.
+defaults write com.jthorney.tracksteer sensitivity -float 1.5
+
+# Fingers required for the drag (2-4).
+defaults write com.jthorney.tracksteer fingerCount -int 2
+
+# Which apps it applies to. Everywhere else is left completely alone.
+defaults write com.jthorney.tracksteer targetBundleIDs -array com.blizzard.worldofwarcraft
+```
+
+Back to defaults:
+
+```bash
+defaults delete com.jthorney.tracksteer
+```
 
 Run with `TRACKSTEER_DEBUG=1` to log finger counts and tap activity to stderr.
 

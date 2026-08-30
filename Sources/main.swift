@@ -34,8 +34,54 @@ enum Config {
     /// Fingers that must be down for the drag.
     static var fingerCount = 2
 
-    /// Scales trackpad movement into mouse movement.
+    /// Scales trackpad movement into mouse movement. 1.0 tracks the system's own
+    /// trackpad acceleration, which macOS has already applied to the scroll
+    /// deltas we read -- so the default inherits Apple's tuning rather than
+    /// inventing a curve.
     static var sensitivity: Double = 1.0
+
+    // MARK: Persistence
+    //
+    // Read from UserDefaults so the feel can be adjusted without a rebuild:
+    //
+    //   defaults write com.jthorney.tracksteer sensitivity -float 1.5
+    //
+    // Re-read periodically rather than only at launch, so a change takes effect
+    // while the app keeps running. Polling a handful of values every couple of
+    // seconds is far simpler than watching for external defaults changes, which
+    // is unreliable across processes.
+
+    // .standard is already this app's own domain, which is exactly where
+    // `defaults write com.jthorney.tracksteer ...` lands. Passing the bundle id
+    // as a suite name would be a no-op that macOS warns about.
+    private static let defaults = UserDefaults.standard
+
+    static func load() {
+        if let value = defaults.object(forKey: "sensitivity") as? Double,
+            value > 0, value <= 10 {
+            sensitivity = value
+        }
+
+        if let value = defaults.object(forKey: "fingerCount") as? Int,
+            value >= 2, value <= 4 {
+            fingerCount = value
+        }
+
+        if let value = defaults.array(forKey: "targetBundleIDs") as? [String],
+            !value.isEmpty {
+            targetBundleIDs = Set(value)
+        }
+    }
+
+    static func watch() {
+        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
+            let before = (sensitivity, fingerCount, targetBundleIDs)
+            load()
+            if before != (sensitivity, fingerCount, targetBundleIDs) {
+                log("settings changed: sensitivity=\(sensitivity) fingers=\(fingerCount)")
+            }
+        }
+    }
 }
 
 // MARK: - MultitouchSupport (private API)
@@ -334,10 +380,13 @@ guard scroll.start() else {
     exit(1)
 }
 
+Config.load()
+Config.watch()
+
 touches.start()
 scope.start()
 
-log("running. \(Config.fingerCount)-finger drag = middle button, in \(Config.targetBundleIDs.joined(separator: ", "))")
+log("running. \(Config.fingerCount)-finger drag = middle button, sensitivity \(Config.sensitivity), in \(Config.targetBundleIDs.joined(separator: ", "))")
 
 // Release the button if we are killed mid-drag, so nothing is left stuck.
 signal(SIGINT) { _ in Mouse.release(); exit(0) }
