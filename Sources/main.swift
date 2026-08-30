@@ -39,16 +39,17 @@ enum Config {
 
     // Two fingers do two different things depending on pressure:
     //
-    //   resting  -> right button drag  = mouselook, turn on the spot
-    //   pressed  -> middle button drag = Move and Steer, run while turning
+    //   resting  -> middle button drag = Move and Steer, run while turning
+    //   pressed  -> right button drag  = mouselook, turn on the spot
     //
-    // Not modes to pick between. Both are live, and pressure decides, which is
-    // what makes turning in place possible without giving up a key.
+    // Resting is the common case -- you run far more than you pivot -- so it
+    // gets the lighter gesture and the better-tested path. If press detection
+    // ever misfires you simply move instead of turning, which is a far kinder
+    // failure than the reverse.
 
-    /// Scales trackpad movement into mouse movement. 1.0 tracks the system's own
+    /// Scales trackpad movement while running. 1.0 tracks the system's own
     /// trackpad acceleration, which macOS has already applied to the scroll
-    /// deltas we read -- so the default inherits Apple's tuning rather than
-    /// inventing a curve.
+    /// deltas we read, so the default inherits Apple's tuning.
     static var sensitivity: Double = 1.0
 
     // MARK: Persistence
@@ -151,9 +152,6 @@ final class State: @unchecked Sendable {
 
     /// The trackpad is physically clicked down.
     var physicalPress = false
-    /// Whether the current press has actually moved, which decides if it was a
-    /// drag or just a click that should be passed along.
-    var pressMoved = false
 
     /// Where the drag started. Every synthetic event is reported at this exact
     /// point and it never moves, so the pointer is still where the player left
@@ -310,6 +308,7 @@ final class ScrollInterceptor {
             (1 << CGEventType.scrollWheel.rawValue)
             | (1 << CGEventType.rightMouseDown.rawValue)
             | (1 << CGEventType.rightMouseUp.rawValue)
+            | (1 << CGEventType.rightMouseDragged.rawValue)
 
         guard
             let tap = CGEvent.tapCreate(
@@ -349,33 +348,42 @@ final class ScrollInterceptor {
         // A two-finger click on a Mac trackpad is a secondary click. We watch it
         // to know whether the fingers are pressed or merely resting, which is
         // what selects between turning and moving.
-        if type == .rightMouseDown || type == .rightMouseUp {
-            guard Config.enabled, state.targetAppActive,
-                state.fingersDown == Config.fingerCount
-            else { return passThrough }
-
+        // Right-button events are watched, never taken. A two-finger press and
+        // drag already produces a real right-button drag, which is exactly
+        // WoW's own mouselook -- so turning on the spot needs no synthesis at
+        // all, and right-click targeting keeps working because we never
+        // interfere with it.
+        //
+        // The earlier version swallowed the button-down to detect pressure,
+        // which meant the game never saw the button held and the drags that
+        // followed were meaningless to it.
+        if type == .rightMouseDown || type == .rightMouseUp || type == .rightMouseDragged {
             if type == .rightMouseDown {
                 state.physicalPress = true
-                state.pressMoved = false
-                return nil  // swallowed; replayed on release if nothing moved
-            }
 
-            state.physicalPress = false
-            let moved = state.pressMoved
-            Mouse.release()
-
-            if !moved {
-                // Pressed and released without moving, so it was an ordinary
-                // right click -- targeting, interacting. Put it back.
-                let location = event.location
-                for phase in [CGEventType.rightMouseDown, .rightMouseUp] {
+                // If we are mid-run, the middle button has to be released
+                // BEFORE the game sees the press, or it ends up holding both
+                // and Move and Steer wins -- which is why turning worked from a
+                // standstill but not while walking.
+                //
+                // Letting the original through cannot guarantee that order, as
+                // our release is injected while this event is still in flight.
+                // So swallow it, release, and re-post the press ourselves. The
+                // real button-up still passes through and balances it.
+                if state.heldButton != nil {
+                    Mouse.release()
                     CGEvent(
-                        mouseEventSource: Mouse.source, mouseType: phase,
-                        mouseCursorPosition: location, mouseButton: .right
+                        mouseEventSource: Mouse.source, mouseType: .rightMouseDown,
+                        mouseCursorPosition: event.location, mouseButton: .right
                     )?.post(tap: .cghidEventTap)
+                    return nil
                 }
             }
-            return nil
+            if type == .rightMouseUp {
+                state.physicalPress = false
+                Mouse.release()
+            }
+            return passThrough
         }
 
         guard type == .scrollWheel else { return passThrough }
@@ -397,11 +405,12 @@ final class ScrollInterceptor {
         let dy = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1))
         let dx = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis2))
 
-        state.pressMoved = true
+        // While the trackpad is physically held the game is already turning
+        // natively, so stay out of the way.
+        guard !state.physicalPress else { return nil }
 
-        // Pressure picks the button: pressed runs and steers, resting turns on
-        // the spot. Mouse.press swaps cleanly if this changes mid-gesture.
-        Mouse.press(state.physicalPress ? .center : .right)
+        Mouse.press(.center)
+
         // Scroll deltas are inverted relative to pointer movement: scrolling
         // "down" moves content up, but dragging down should move the pointer
         // down.
@@ -537,7 +546,7 @@ final class MenuBar: NSObject {
 
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(
-            title: "Two fingers turn · press down to move · in World of Warcraft",
+            title: "Two fingers move · press down to turn on the spot",
             action: nil, keyEquivalent: ""))
         menu.items.last?.isEnabled = false
 
