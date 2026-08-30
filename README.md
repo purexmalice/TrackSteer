@@ -73,8 +73,9 @@ Run with `TRACKSTEER_DEBUG=1` to log finger counts and tap activity to stderr.
 - Two-finger scroll is consumed inside the target app, so camera zoom needs
   keys. BindSwap's preset binds `=` and `-`.
 - Three fingers is left alone — macOS uses it for Spaces.
-- Ad-hoc signed, so distributing it means users see a Gatekeeper warning unless
-  it's notarized, which requires a paid Apple Developer account.
+- Ad-hoc signed by default, so users see a Gatekeeper warning and macOS revokes
+  Accessibility on every update. See [NOTARIZING.md](NOTARIZING.md) to sign it
+  properly with a Developer ID, which fixes both.
 
 ## Licence
 

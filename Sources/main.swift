@@ -93,6 +93,7 @@ enum Config {
     static func save() {
         defaults.set(sensitivity, forKey: "sensitivity")
         defaults.set(enabled, forKey: "enabled")
+        defaults.set(Array(targetBundleIDs), forKey: "targetBundleIDs")
 
     }
 
@@ -545,6 +546,44 @@ final class MenuBar: NSObject {
         }
 
         menu.addItem(.separator())
+
+        let appsHeader = NSMenuItem(title: "Active in", action: nil, keyEquivalent: "")
+        appsHeader.isEnabled = false
+        menu.addItem(appsHeader)
+
+        // Everything already chosen, so apps that are not running right now stay
+        // visible and removable rather than vanishing from the list.
+        var listed = Set<String>()
+        for bundleID in Config.targetBundleIDs.sorted() {
+            let name =
+                NSWorkspace.shared.runningApplications
+                .first { $0.bundleIdentifier == bundleID }?.localizedName
+                ?? bundleID
+            let entry = NSMenuItem(
+                title: "  \(name)", action: #selector(toggleTarget(_:)), keyEquivalent: "")
+            entry.target = self
+            entry.representedObject = bundleID
+            entry.state = .on
+            menu.addItem(entry)
+            listed.insert(bundleID)
+        }
+
+        let addMenu = NSMenu()
+        for app in candidateApps() {
+            guard let bundleID = app.bundleIdentifier, !listed.contains(bundleID) else { continue }
+            let entry = NSMenuItem(
+                title: app.localizedName ?? bundleID,
+                action: #selector(toggleTarget(_:)), keyEquivalent: "")
+            entry.target = self
+            entry.representedObject = bundleID
+            addMenu.addItem(entry)
+        }
+
+        let addItem = NSMenuItem(title: "  Add an app…", action: nil, keyEquivalent: "")
+        addItem.submenu = addMenu
+        menu.addItem(addItem)
+
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(
             title: "Two fingers move · press down to turn on the spot",
             action: nil, keyEquivalent: ""))
@@ -568,6 +607,28 @@ final class MenuBar: NSObject {
     @objc private func setSpeed(_ sender: NSMenuItem) {
         guard MenuBar.speeds.indices.contains(sender.tag) else { return }
         Config.sensitivity = MenuBar.speeds[sender.tag].1
+        Config.save()
+        rebuild()
+    }
+
+    /// Apps worth offering: anything running with a real user interface. The
+    /// gesture is useful well beyond one game -- any app that wants a held
+    /// middle button and cannot get one from a clickpad.
+    private func candidateApps() -> [NSRunningApplication] {
+        NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != nil }
+            .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
+    }
+
+    @objc private func toggleTarget(_ sender: NSMenuItem) {
+        guard let bundleID = sender.representedObject as? String else { return }
+
+        if Config.targetBundleIDs.contains(bundleID) {
+            Config.targetBundleIDs.remove(bundleID)
+        } else {
+            Config.targetBundleIDs.insert(bundleID)
+        }
+
         Config.save()
         rebuild()
     }
