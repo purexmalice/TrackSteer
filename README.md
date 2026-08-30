@@ -26,24 +26,42 @@ Everything is scoped to a single application. Two-finger scrolling is far too
 important to break system-wide, so outside the target app every event passes
 through untouched.
 
-## Build
+## Install
 
-Needs Xcode command line tools. No project file, no packages.
+**[Download the latest release](https://github.com/purexmalice/TrackSteer/releases/latest)**
+— no Xcode, no Terminal, no building anything.
+
+1. Unzip and drag `TrackSteer.app` into your Applications folder.
+2. **Right-click it and choose Open** — not a double-click. macOS will say the
+   developer cannot be verified, because the app is signed by me rather than
+   paid-for-and-notarised through Apple. Right-click → Open gives you a button
+   to open it anyway. You only do this once.
+3. It appears in the menu bar as **TS**. Click it and choose *Open Accessibility
+   settings…*, then tick TrackSteer in the list. It cannot read the trackpad
+   without that, and it will tell you so until you do.
+
+Then bind **Move and Steer** to the middle mouse button in World of Warcraft.
+The [BindSwap](https://github.com/purexmalice/BindSwap) addon does it in one
+click with its Trackpad setup button.
+
+### Updating
+
+macOS ties Accessibility permission to the app's exact signature, and that
+changes with every build — so after updating, **remove the old TrackSteer entry
+in Accessibility with the `−` button and add it back**. Toggling it off and on
+is not enough. [NOTARIZING.md](NOTARIZING.md) explains how to end that
+permanently.
+
+## Building it yourself
+
+Only needed if you want to change something. Requires Xcode command line tools;
+there is no project file and no dependencies.
 
 ```bash
 ./build.sh
 ```
 
 Builds `TrackSteer.app`, ad-hoc signs it, and installs to `~/Applications`.
-
-## Setup
-
-1. Launch it, then grant **Accessibility** in System Settings → Privacy &
-   Security. Intercepting and posting input events is exactly what that
-   permission governs, so it cannot work without it.
-2. Bind `MOVEANDSTEER` to the middle mouse button in WoW. The
-   [BindSwap](../bindswap-addon) addon does this in one click via its
-   **Trackpad 2-finger** preset.
 
 ## Settings
 
