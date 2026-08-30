@@ -1,6 +1,6 @@
 # TrackSteer
 
-Two-finger drag becomes a held middle mouse button — in one app only.
+Two fingers turn your character. Press down and they move it. In one app only.
 
 ## Why
 

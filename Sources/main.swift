@@ -37,13 +37,13 @@ enum Config {
     /// Master switch, so the gesture can be paused without quitting.
     static var enabled = true
 
-    /// How the drag is triggered.
-    ///   .rest  — two fingers touching is enough. Nothing is held, which is
-    ///            more comfortable but unlike any mouse.
-    ///   .press — the trackpad must be physically clicked, matching the
-    ///            both-buttons-held gesture this replaces.
-    enum Trigger: String { case rest, press }
-    static var trigger: Trigger = .rest
+    // Two fingers do two different things depending on pressure:
+    //
+    //   resting  -> right button drag  = mouselook, turn on the spot
+    //   pressed  -> middle button drag = Move and Steer, run while turning
+    //
+    // Not modes to pick between. Both are live, and pressure decides, which is
+    // what makes turning in place possible without giving up a key.
 
     /// Scales trackpad movement into mouse movement. 1.0 tracks the system's own
     /// trackpad acceleration, which macOS has already applied to the scroll
@@ -87,16 +87,12 @@ enum Config {
             enabled = value
         }
 
-        if let raw = defaults.string(forKey: "trigger"),
-            let value = Trigger(rawValue: raw) {
-            trigger = value
-        }
     }
 
     static func save() {
         defaults.set(sensitivity, forKey: "sensitivity")
         defaults.set(enabled, forKey: "enabled")
-        defaults.set(trigger.rawValue, forKey: "trigger")
+
     }
 
     static var onExternalChange: (() -> Void)?
@@ -109,9 +105,6 @@ enum Config {
             if changed {
                 log("settings changed: sensitivity=\(sensitivity) fingers=\(fingerCount)")
             }
-
-            // Settings sent from the addon, arriving via SavedVariables.
-            if AddonSettings.poll() { changed = true }
 
             if changed { onExternalChange?() }
         }
@@ -152,10 +145,11 @@ final class State: @unchecked Sendable {
     static let shared = State()
 
     var fingersDown: Int = 0
-    var middleButtonHeld = false
+    /// Which button we are currently holding down, if any.
+    var heldButton: CGMouseButton?
     var targetAppActive = false
 
-    /// Press mode only: the trackpad is physically held down.
+    /// The trackpad is physically clicked down.
     var physicalPress = false
     /// Whether the current press has actually moved, which decides if it was a
     /// drag or just a click that should be passed along.
@@ -172,30 +166,41 @@ final class State: @unchecked Sendable {
 enum Mouse {
     static let source = CGEventSource(stateID: .hidSystemState)
 
-    static func press() {
+    static func press(_ button: CGMouseButton) {
         let state = State.shared
-        guard !state.middleButtonHeld else { return }
+        if state.heldButton == button { return }
+
+        // Switching buttons mid-gesture: let go of the old one first, or WoW
+        // sees both held and does something neither was meant to do.
+        release()
 
         state.anchor = currentCursor()
-        post(.otherMouseDown, delta: .zero)
-        state.middleButtonHeld = true
+        post(down(button), button: button, delta: .zero)
+        state.heldButton = button
     }
 
     static func release() {
         let state = State.shared
-        guard state.middleButtonHeld else { return }
+        guard let button = state.heldButton else { return }
 
-        post(.otherMouseUp, delta: .zero)
-        state.middleButtonHeld = false
-
-        // Belt and braces: if anything else nudged the pointer while the game
-        // had it hidden, put it back where the drag began.
+        post(up(button), button: button, delta: .zero)
+        state.heldButton = nil
         CGWarpMouseCursorPosition(state.anchor)
     }
 
     static func drag(dx: Double, dy: Double) {
-        guard State.shared.middleButtonHeld else { return }
-        post(.otherMouseDragged, delta: CGPoint(x: dx, y: dy))
+        guard let button = State.shared.heldButton else { return }
+        post(dragged(button), button: button, delta: CGPoint(x: dx, y: dy))
+    }
+
+    private static func down(_ b: CGMouseButton) -> CGEventType {
+        b == .right ? .rightMouseDown : .otherMouseDown
+    }
+    private static func up(_ b: CGMouseButton) -> CGEventType {
+        b == .right ? .rightMouseUp : .otherMouseUp
+    }
+    private static func dragged(_ b: CGMouseButton) -> CGEventType {
+        b == .right ? .rightMouseDragged : .otherMouseDragged
     }
 
     private static func currentCursor() -> CGPoint {
@@ -203,7 +208,7 @@ enum Mouse {
         return event.location
     }
 
-    private static func post(_ type: CGEventType, delta: CGPoint) {
+    private static func post(_ type: CGEventType, button: CGMouseButton, delta: CGPoint) {
         let state = State.shared
 
         // Deliberately NOT accumulating a position. A game steers from the delta
@@ -215,7 +220,7 @@ enum Mouse {
                 mouseEventSource: source,
                 mouseType: type,
                 mouseCursorPosition: state.anchor,
-                mouseButton: .center
+                mouseButton: button
             )
         else { return }
 
@@ -249,7 +254,7 @@ final class TouchMonitor {
         // through two on the way down, which would otherwise press the button
         // and leave it stuck, turning later movement into a drag and stopping
         // three-finger scrolling from working at all.
-        if Int(numTouches) != Config.fingerCount && State.shared.middleButtonHeld {
+        if Int(numTouches) != Config.fingerCount && State.shared.heldButton != nil {
             DispatchQueue.main.async { Mouse.release() }
         }
         return 0
@@ -341,24 +346,27 @@ final class ScrollInterceptor {
             return passThrough
         }
 
-        // Press mode: a two-finger click starts the drag and holds it.
+        // A two-finger click on a Mac trackpad is a secondary click. We watch it
+        // to know whether the fingers are pressed or merely resting, which is
+        // what selects between turning and moving.
         if type == .rightMouseDown || type == .rightMouseUp {
-            guard Config.enabled, Config.trigger == .press, state.targetAppActive,
+            guard Config.enabled, state.targetAppActive,
                 state.fingersDown == Config.fingerCount
             else { return passThrough }
 
             if type == .rightMouseDown {
                 state.physicalPress = true
                 state.pressMoved = false
-                return nil  // swallow; replayed on release if it was only a click
+                return nil  // swallowed; replayed on release if nothing moved
             }
 
             state.physicalPress = false
+            let moved = state.pressMoved
             Mouse.release()
 
-            if !state.pressMoved {
-                // Never moved, so the player meant an ordinary right click.
-                // Put it back rather than eating it.
+            if !moved {
+                // Pressed and released without moving, so it was an ordinary
+                // right click -- targeting, interacting. Put it back.
                 let location = event.location
                 for phase in [CGEventType.rightMouseDown, .rightMouseUp] {
                     CGEvent(
@@ -374,15 +382,12 @@ final class ScrollInterceptor {
 
         // Outside the target app, or without the right fingers down, this is an
         // ordinary scroll and none of our business.
-        debug("scroll: fingers=\(state.fingersDown) target=\(state.targetAppActive) held=\(state.middleButtonHeld)")
+        debug("scroll: fingers=\(state.fingersDown) target=\(state.targetAppActive) held=\(String(describing: state.heldButton))")
 
-        // In press mode the trackpad must also be held down.
-        let triggered = Config.trigger == .rest || state.physicalPress
-
-        guard Config.enabled, triggered, state.targetAppActive,
+        guard Config.enabled, state.targetAppActive,
             state.fingersDown == Config.fingerCount
         else {
-            if state.middleButtonHeld { Mouse.release() }
+            if state.heldButton != nil { Mouse.release() }
             return passThrough
         }
 
@@ -393,7 +398,10 @@ final class ScrollInterceptor {
         let dx = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis2))
 
         state.pressMoved = true
-        Mouse.press()
+
+        // Pressure picks the button: pressed runs and steers, resting turns on
+        // the spot. Mouse.press swaps cleanly if this changes mid-gesture.
+        Mouse.press(state.physicalPress ? .center : .right)
         // Scroll deltas are inverted relative to pointer movement: scrolling
         // "down" moves content up, but dragging down should move the pointer
         // down.
@@ -430,89 +438,9 @@ final class AppScope {
         onChange?()
 
         // Never leave the button stuck down when switching away mid-drag.
-        if !active && State.shared.middleButtonHeld {
+        if !active && State.shared.heldButton != nil {
             Mouse.release()
         }
-    }
-}
-
-// MARK: - Settings from the addon
-//
-// BindSwap cannot talk to this app while the game runs -- WoW addons have no
-// file or network access. The one channel is SavedVariables, which the client
-// flushes on /reload or logout. So we watch that file instead.
-//
-// Parsed with a narrow regex rather than a Lua interpreter: we want exactly
-// three known values out of a file the game owns, and anything we do not
-// recognise is ignored rather than guessed at.
-
-enum AddonSettings {
-    static let searchRoots = [
-        "/Applications/World of Warcraft/_retail_/WTF/Account"
-    ]
-
-    private static var lastSeen: Date?
-
-    /// Locate BindSwap.lua under any account folder.
-    static func savedVariablesPath() -> String? {
-        let fm = FileManager.default
-        for root in searchRoots {
-            guard let accounts = try? fm.contentsOfDirectory(atPath: root) else { continue }
-            for account in accounts {
-                let path = "\(root)/\(account)/SavedVariables/BindSwap.lua"
-                if fm.fileExists(atPath: path) { return path }
-            }
-        }
-        return nil
-    }
-
-    private static func value(_ key: String, in text: String) -> String? {
-        // Matches  ["key"] = value  with or without quotes.
-        let pattern = "\\[\"\(key)\"\\]\\s*=\\s*\"?([^\",\n]+)\"?"
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-            let match = regex.firstMatch(
-                in: text, range: NSRange(text.startIndex..., in: text)),
-            let range = Range(match.range(at: 1), in: text)
-        else { return nil }
-        return text[range].trimmingCharacters(in: .whitespaces)
-    }
-
-    /// Returns true if anything actually changed.
-    static func poll() -> Bool {
-        guard let path = savedVariablesPath(),
-            let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-            let modified = attrs[.modificationDate] as? Date
-        else { return false }
-
-        // Only re-read when the game has rewritten the file.
-        if let seen = lastSeen, seen >= modified { return false }
-        lastSeen = modified
-
-        guard let text = try? String(contentsOfFile: path, encoding: .utf8),
-            let blockStart = text.range(of: "[\"trackSteer\"]")
-        else { return false }
-
-        let block = String(text[blockStart.lowerBound...].prefix(400))
-        var changed = false
-
-        if let raw = value("trigger", in: block),
-            let mode = Config.Trigger(rawValue: raw), mode != Config.trigger {
-            Config.trigger = mode
-            changed = true
-        }
-
-        if let raw = value("sensitivity", in: block), let number = Double(raw),
-            number > 0, number <= 10, abs(number - Config.sensitivity) > 0.01 {
-            Config.sensitivity = number
-            changed = true
-        }
-
-        if changed {
-            Mouse.release()  // never carry a drag across a settings change
-            Config.save()
-            log("settings updated from the addon: \(Config.trigger.rawValue), \(Config.sensitivity)")
-        }
-        return changed
     }
 }
 
@@ -592,22 +520,6 @@ final class MenuBar: NSObject {
 
         menu.addItem(.separator())
 
-        let triggerHeader = NSMenuItem(title: "Gesture", action: nil, keyEquivalent: "")
-        triggerHeader.isEnabled = false
-        menu.addItem(triggerHeader)
-
-        for (title, mode) in [
-            ("  Two fingers resting", Config.Trigger.rest),
-            ("  Two fingers pressed down", Config.Trigger.press),
-        ] {
-            let entry = NSMenuItem(
-                title: title, action: #selector(setTrigger(_:)), keyEquivalent: "")
-            entry.target = self
-            entry.representedObject = mode.rawValue
-            entry.state = Config.trigger == mode ? .on : .off
-            menu.addItem(entry)
-        }
-
         menu.addItem(.separator())
 
         let header = NSMenuItem(title: "Turn speed", action: nil, keyEquivalent: "")
@@ -625,7 +537,7 @@ final class MenuBar: NSObject {
 
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(
-            title: "Two-finger drag to run and steer, in World of Warcraft",
+            title: "Two fingers turn · press down to move · in World of Warcraft",
             action: nil, keyEquivalent: ""))
         menu.items.last?.isEnabled = false
 
@@ -647,17 +559,6 @@ final class MenuBar: NSObject {
     @objc private func setSpeed(_ sender: NSMenuItem) {
         guard MenuBar.speeds.indices.contains(sender.tag) else { return }
         Config.sensitivity = MenuBar.speeds[sender.tag].1
-        Config.save()
-        rebuild()
-    }
-
-    @objc private func setTrigger(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String,
-            let mode = Config.Trigger(rawValue: raw)
-        else { return }
-
-        Config.trigger = mode
-        Mouse.release()  // never leave a drag hanging across a mode change
         Config.save()
         rebuild()
     }
