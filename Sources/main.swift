@@ -75,9 +75,10 @@ final class State: @unchecked Sendable {
     var middleButtonHeld = false
     var targetAppActive = false
 
-    /// Where synthetic drag events are reported. Kept in step with the real
-    /// cursor so the pointer does not jump when a drag begins.
-    var cursor: CGPoint = .zero
+    /// Where the drag started. Every synthetic event is reported at this exact
+    /// point and it never moves, so the pointer is still where the player left
+    /// it when they lift their fingers.
+    var anchor: CGPoint = .zero
 }
 
 // MARK: - Event generation
@@ -89,7 +90,7 @@ enum Mouse {
         let state = State.shared
         guard !state.middleButtonHeld else { return }
 
-        state.cursor = currentCursor()
+        state.anchor = currentCursor()
         post(.otherMouseDown, delta: .zero)
         state.middleButtonHeld = true
     }
@@ -100,6 +101,10 @@ enum Mouse {
 
         post(.otherMouseUp, delta: .zero)
         state.middleButtonHeld = false
+
+        // Belt and braces: if anything else nudged the pointer while the game
+        // had it hidden, put it back where the drag began.
+        CGWarpMouseCursorPosition(state.anchor)
     }
 
     static func drag(dx: Double, dy: Double) {
@@ -115,16 +120,15 @@ enum Mouse {
     private static func post(_ type: CGEventType, delta: CGPoint) {
         let state = State.shared
 
-        // Games read relative motion, but the cursor position still has to be
-        // sane for anything that reads it, so track both.
-        state.cursor.x += delta.x
-        state.cursor.y += delta.y
-
+        // Deliberately NOT accumulating a position. A game steers from the delta
+        // fields below; reporting a moving location as well would drag the real
+        // pointer across the screen while it is hidden, so it would be somewhere
+        // else entirely when the player lifts their fingers.
         guard
             let event = CGEvent(
                 mouseEventSource: source,
                 mouseType: type,
-                mouseCursorPosition: state.cursor,
+                mouseCursorPosition: state.anchor,
                 mouseButton: .center
             )
         else { return }
