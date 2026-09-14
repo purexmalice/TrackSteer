@@ -91,6 +91,9 @@ Run with `TRACKSTEER_DEBUG=1` to log finger counts and tap activity to stderr.
 - Two-finger scroll is consumed inside the target app, so camera zoom needs
   keys. BindSwap's preset binds `=` and `-`.
 - Three fingers is left alone — macOS uses it for Spaces.
+- Sleeping severs the connection to the trackpad without any notification, so
+  the app re-registers on every wake. Before that fix it would silently stop
+  working after the Mac slept, while still reporting itself healthy.
 - Ad-hoc signed by default, so users see a Gatekeeper warning and macOS revokes
   Accessibility on every update. See [NOTARIZING.md](NOTARIZING.md) to sign it
   properly with a Developer ID, which fixes both.

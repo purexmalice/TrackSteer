@@ -291,6 +291,24 @@ final class TouchMonitor {
         }
         devices.removeAll()
     }
+
+    /// Sleeping severs the connection to the trackpad, and nothing tells us --
+    /// finger counts simply stop arriving and the gesture silently never fires
+    /// again, while permission and focus both still look fine. So re-register
+    /// on every wake.
+    ///
+    /// The delay matters: the framework's internal thread needs a moment to
+    /// finish tearing down before new devices can be started cleanly.
+    func restart() {
+        stop()
+        State.shared.fingersDown = 0
+        Mouse.release()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.start()
+            log("re-registered the trackpad after wake")
+        }
+    }
 }
 
 // MARK: - Event tap
@@ -419,6 +437,25 @@ final class ScrollInterceptor {
 
         // Swallow it, so the game does not also receive a scroll.
         return nil
+    }
+}
+
+// MARK: - Sleep and wake
+
+final class SleepWatcher {
+    private var observers: [NSObjectProtocol] = []
+
+    func start(onWake: @escaping () -> Void) {
+        let center = NSWorkspace.shared.notificationCenter
+
+        // Both matter: the system waking, and the screens waking. Closing and
+        // reopening a laptop lid does not always produce the same one.
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
+            observers.append(
+                center.addObserver(forName: name, object: nil, queue: .main) { _ in
+                    onWake()
+                })
+        }
     }
 }
 
@@ -661,6 +698,7 @@ func log(_ message: String) {
 let touches = TouchMonitor()
 let scroll = ScrollInterceptor()
 let scope = AppScope()
+let sleepWatcher = SleepWatcher()
 
 // Ask for Accessibility, prompting if it is missing, and keep running either
 // way. Exiting here was a mistake: an ad-hoc signature changes on every build,
@@ -706,6 +744,7 @@ app.setActivationPolicy(.accessory)  // background only, no Dock icon
 let menuBar = MenuBar()
 menuBar.start()
 scope.onChange = { menuBar.rebuild() }
+sleepWatcher.start { touches.restart() }
 Config.onExternalChange = { menuBar.rebuild() }
 scope.start()
 
